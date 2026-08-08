@@ -1,57 +1,107 @@
-name: Build AWG for ImmortalWrt 25.12.1
+name: Build AmneziaWG for ImmortalWrt
+
+# 用法：
+# 1. 新建一个自己的 GitHub 仓库，把本文件放到 .github/workflows/build-awg-immortalwrt.yml
+# 2. 仓库 -> Actions -> Build AmneziaWG for ImmortalWrt -> Run workflow
+# 3. 填入你路由器的 target / subtarget，等 10~20 分钟
+# 4. 在任务页面底部 Artifacts 下载 .apk 包
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "ImmortalWrt 版本号（Status -> Overview 里能看到）"
+        required: true
+        default: "25.12.1"
+      target:
+        description: "target，例如 x86 / mediatek / ramips / rockchip"
+        required: true
+        default: "x86"
+      subtarget:
+        description: "subtarget，例如 64 / filogic / mt7621 / armv8"
+        required: true
+        default: "64"
+      awg_repo:
+        description: "AmneziaWG 包源码仓库"
+        required: true
+        default: "https://github.com/Slava-Shchipunov/awg-openwrt.git"
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Dependencies
+      - name: 安装编译依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y zstd build-essential libncurses5-dev libncursesw5-dev gawk git subversion libssl-dev python3 unzip file
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3 python3-setuptools rsync swig unzip zlib1g-dev file wget zstd curl
 
-      - name: Fetch and Setup ImmortalWrt 25.12.1 SDK
+      - name: 下载并解压 ImmortalWrt SDK
         run: |
-          # 1. 下载并解压 SDK
-          SDK_FILENAME=$(curl -s https://downloads.immortalwrt.org/releases/25.12.1/targets/x86/64/ | grep -oE 'immortalwrt-sdk-[^"]+\.tar\.(zst|xz)' | head -n 1)
-          echo "Downloading SDK: $SDK_FILENAME"
-          wget -q "https://downloads.immortalwrt.org/releases/25.12.1/targets/x86/64/$SDK_FILENAME"
-          
-          mkdir -p sdk
-          tar -I zstd -xf immortalwrt-sdk-*.tar.zst -C sdk --strip-components=1 2>/dev/null || tar -xf immortalwrt-sdk-*.tar.* -C sdk --strip-components=1
-          
-          cd sdk
-          
-          # 2. 引入并更新 AWG feed 源码
-          echo "src-git amneziawg https://github.com/amnezia-vpn/amneziawg-openwrt.git" >> feeds.conf.default
-          ./scripts/feeds update amneziawg
-          ./scripts/feeds install -a -p amneziawg
-          
-          # 3. 彻底禁用 ALL_KMODS，防止 SDK 编译无关声卡/RTC驱动
+          set -e
+          BASE="https://downloads.immortalwrt.org/releases/${{ inputs.version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}"
+          echo "从 $BASE 查找 SDK ..."
+          SDK_FILE=$(curl -fsSL "$BASE/" \
+            | grep -oE 'immortalwrt-sdk-[^"<>]+\.tar\.zst' | head -n1)
+          if [ -z "$SDK_FILE" ]; then
+            echo "没有找到 SDK，请确认 version/target/subtarget 是否正确"; exit 1
+          fi
+          echo "SDK = $SDK_FILE"
+          wget -q "$BASE/$SDK_FILE"
+          tar --zstd -xf "$SDK_FILE"
+          mv "$(basename "$SDK_FILE" .tar.zst)" sdk
+
+      - name: 拉取 AmneziaWG 包源码
+        working-directory: sdk
+        run: |
+          git clone --depth=1 "${{ inputs.awg_repo }}" package/awg
+          rm -rf package/awg/.git package/awg/.github
+
+      - name: 更新 feeds
+        working-directory: sdk
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成配置
+        working-directory: sdk
+        run: |
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_kmod-amneziawg=m
+          CONFIG_PACKAGE_amneziawg-tools=y
+          CONFIG_PACKAGE_luci-proto-amneziawg=y
+          CONFIG_PACKAGE_luci-app-amneziawg=y
+          CONFIG_PACKAGE_luci-i18n-amneziawg-zh-cn=y
+          EOF
           make defconfig
-          sed -i 's/CONFIG_ALL_KMODS=y/# CONFIG_ALL_KMODS is not set/' .config
-          sed -i '/CONFIG_PACKAGE_kmod-/d' .config
-          
-          # 4. 仅注入 AWG 目标
-          echo "CONFIG_PACKAGE_kmod-amneziawg=m" >> .config
-          echo "CONFIG_PACKAGE_amneziawg-tools=m" >> .config
-          echo "CONFIG_PACKAGE_luci-proto-amneziawg=m" >> .config
+          echo "===== 已选中的 awg 相关配置 ====="
+          grep -i amneziawg .config || true
 
-      - name: Compile AWG Packages
+      - name: 编译
+        working-directory: sdk
         run: |
-          cd sdk
-          # 仅编译 AWG 专属包，IGNORE_ERRORS=1 可防止 SDK 内核预设报错中断
-          make package/feeds/amneziawg/kmod-amneziawg/compile V=s -j$(nproc) IGNORE_ERRORS=1
-          make package/feeds/amneziawg/amneziawg-tools/compile V=s -j$(nproc) IGNORE_ERRORS=1
-          make package/feeds/amneziawg/luci-proto-amneziawg/compile V=s -j$(nproc) IGNORE_ERRORS=1
+          make -j$(nproc) package/kmod-amneziawg/compile \
+            || make -j1 V=s package/kmod-amneziawg/compile
+          make -j$(nproc) package/amneziawg-tools/compile \
+            || make -j1 V=s package/amneziawg-tools/compile
+          make -j$(nproc) package/luci-proto-amneziawg/compile \
+            || make -j1 V=s package/luci-proto-amneziawg/compile
+          # AWG 2.0 才有 luci-app，失败不影响其它包
+          make -j$(nproc) package/luci-app-amneziawg/compile || true
 
-      - name: Upload APK Artifacts
+      - name: 收集产物
+        run: |
+          mkdir -p out
+          find sdk/bin -type f \( -name "*amneziawg*.apk" -o -name "*amneziawg*.ipk" \) \
+            -exec cp -v {} out/ \;
+          echo "===== 产物列表 ====="
+          ls -lh out/
+          test -n "$(ls -A out/)"
+
+      - name: 上传
         uses: actions/upload-artifact@v4
         with:
-          name: ImmortalWrt-25.12.1-AWG-x86_64-APKs
-          path: sdk/bin/**/*.apk
+          name: amneziawg-${{ inputs.version }}-${{ inputs.target }}-${{ inputs.subtarget }}
+          path: out/*
+          if-no-files-found: error
