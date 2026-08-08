@@ -1,11 +1,5 @@
 name: Build AmneziaWG for ImmortalWrt
 
-# 用法：
-# 1. 放到自己仓库的 .github/workflows/build-awg-immortalwrt.yml
-# 2. Actions -> Build AmneziaWG for ImmortalWrt -> Run workflow
-# 3. 填 target / subtarget（SSH: . /etc/openwrt_release && echo $DISTRIB_TARGET）
-# 4. 任务页底部 Artifacts 下载 .apk
-
 on:
   workflow_dispatch:
     inputs:
@@ -36,13 +30,15 @@ jobs:
         run: |
           set -e
           git clone --depth=1 "${{ inputs.awg_repo }}" /tmp/awg
+          mkdir -p awgsrc
           for p in kmod-amneziawg amneziawg-tools luci-proto-amneziawg luci-app-amneziawg; do
             if [ -d "/tmp/awg/$p" ]; then
-              cp -r "/tmp/awg/$p" ./
+              cp -r "/tmp/awg/$p" awgsrc/
               echo "已加入包目录: $p"
             fi
           done
-          ls -d */ 
+          chmod -R a+rX awgsrc
+          ls awgsrc
 
       - name: 选择可用的 SDK 镜像 tag
         id: pick
@@ -63,25 +59,58 @@ jobs:
           exit 1
 
       - name: 编译
-        uses: immortalwrt/gh-action-sdk@master
-        env:
-          ARCH: ${{ steps.pick.outputs.arch }}
-          PACKAGES: kmod-amneziawg amneziawg-tools luci-proto-amneziawg
-          FEEDNAME: awg
-          IGNORE_ERRORS: 1
-          NO_REFRESH_CHECK: 1
-          NO_SHFMT_CHECK: 1
-          BUILD_LOG: 1
-          V: s
-
-      - name: 收集产物
         run: |
-          mkdir -p out
-          find bin -type f \( -name "*amneziawg*.apk" -o -name "*amneziawg*.ipk" \) \
-            -exec cp -v {} out/ \; 2>/dev/null || true
-          echo "===== 产物列表 ====="
-          ls -lh out/ || true
-          test -n "$(ls -A out/ 2>/dev/null)"
+          set -e
+          mkdir -p out logs
+          chmod 777 out logs
+          docker run --rm \
+            -v "$PWD/awgsrc:/src:ro" \
+            -v "$PWD/out:/out" \
+            -v "$PWD/logs:/logs" \
+            immortalwrt/sdk:${{ steps.pick.outputs.arch }} \
+            bash -c "
+              set -e
+              SDK=\$(ls -d /home/build/*/ 2>/dev/null | head -n1)
+              if [ -z \"\$SDK\" ] || [ ! -x \"\$SDK/scripts/feeds\" ]; then
+                echo '找不到 SDK 目录，容器内容如下：'; ls -la /home/build || ls -la /
+                exit 1
+              fi
+              echo \">>> SDK 目录: \$SDK\"
+              cd \"\$SDK\"
+
+              cp -r /src/* package/
+              ./scripts/feeds update -a
+              ./scripts/feeds install -a
+
+              printf '%s\n' \
+                'CONFIG_PACKAGE_kmod-amneziawg=m' \
+                'CONFIG_PACKAGE_amneziawg-tools=y' \
+                'CONFIG_PACKAGE_luci-proto-amneziawg=y' >> .config
+              make defconfig
+
+              # 关键：自动修正 PKG_MIRROR_HASH
+              for p in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
+                [ -d \"package/\$p\" ] || continue
+                echo \">>> download \$p\"
+                make \"package/\$p/download\" V=s
+                echo \">>> check+fixup \$p\"
+                make \"package/\$p/check\" FIXUP=1 V=s || true
+                grep -H 'PKG_MIRROR_HASH' \"package/\$p/Makefile\" || true
+              done
+
+              echo '>>> 开始编译'
+              make -j\$(nproc) package/kmod-amneziawg/compile V=s 2>&1 | tee /logs/kmod.log
+              make -j\$(nproc) package/amneziawg-tools/compile V=s 2>&1 | tee /logs/tools.log
+              make -j\$(nproc) package/luci-proto-amneziawg/compile V=s 2>&1 | tee /logs/luci.log
+
+              find bin -type f \\( -name '*amneziawg*.apk' -o -name '*amneziawg*.ipk' \\) \
+                -exec cp -v {} /out/ \\;
+            "
+
+      - name: 产物列表
+        run: |
+          ls -lh out/
+          test -n "$(ls -A out/)"
 
       - name: 上传
         uses: actions/upload-artifact@v4
@@ -90,7 +119,7 @@ jobs:
           path: out/*
           if-no-files-found: error
 
-      - name: 上传编译日志（失败时排查用）
+      - name: 上传编译日志
         if: always()
         uses: actions/upload-artifact@v4
         with:
