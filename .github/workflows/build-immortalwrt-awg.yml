@@ -10,36 +10,47 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd build-essential libncurses5-dev libncursesw5-dev gawk git subversion libssl-dev python3 unzip file
+
       - name: Fetch and Setup ImmortalWrt 25.12.1 SDK
         run: |
-          # 1. 动态获取 ImmortalWrt 25.12.1 x86/64 官方 SDK 的准确下载地址
-          SDK_FILENAME=$(curl -s https://downloads.immortalwrt.org/releases/25.12.1/targets/x86/64/ | grep -oE 'immortalwrt-sdk-25\.12\.1-x86-64[^"]+\.tar\.xz' | head -n 1)
-          echo "Found SDK: $SDK_FILENAME"
+          # 1. 兼容 .tar.zst 与 .tar.xz 动态查找并下载 25.12.1 x86_64 SDK
+          SDK_FILENAME=$(curl -s https://downloads.immortalwrt.org/releases/25.12.1/targets/x86/64/ | grep -oE 'immortalwrt-sdk-[^"]+\.tar\.(zst|xz)' | head -n 1)
+          echo "Downloading SDK: $SDK_FILENAME"
           
-          wget "https://downloads.immortalwrt.org/releases/25.12.1/targets/x86/64/$SDK_FILENAME"
-          tar -xf immortalwrt-sdk-*.tar.xz
-          mv immortalwrt-sdk-* sdk
+          wget -q "https://downloads.immortalwrt.org/releases/25.12.1/targets/x86/64/$SDK_FILENAME"
+          
+          # 2. 创建目录并解压
+          mkdir -p sdk
+          tar -I zstd -xf immortalwrt-sdk-*.tar.zst -C sdk --strip-components=1 2>/dev/null || tar -xf immortalwrt-sdk-*.tar.* -C sdk --strip-components=1
+          
           cd sdk
           
-          # 2. 引入 Amnezia 官方源码
+          # 3. 引入并安装 AWG 官方 feed 源码
           echo "src-git amneziawg https://github.com/amnezia-vpn/amneziawg-openwrt.git" >> feeds.conf.default
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          ./scripts/feeds update amneziawg
+          ./scripts/feeds install -a -p amneziawg
           
-          # 3. 写入 AWG 编译配置
+          # 4. 配置需要编译的包
           make defconfig
           echo "CONFIG_PACKAGE_kmod-amneziawg=m" >> .config
           echo "CONFIG_PACKAGE_amneziawg-tools=m" >> .config
-          echo "CONFIG_PACKAGE_luci-app-amneziawg=m" >> .config
+          echo "CONFIG_PACKAGE_luci-proto-amneziawg=m" >> .config
           make defconfig
 
       - name: Compile AWG Packages
         run: |
           cd sdk
-          make package/amneziawg/compile V=s -j$(nproc)
+          # 显式编译官方仓库中的三个目标包
+          make package/kmod-amneziawg/compile V=s -j$(nproc)
+          make package/amneziawg-tools/compile V=s -j$(nproc)
+          make package/luci-proto-amneziawg/compile V=s -j$(nproc)
 
       - name: Upload APK Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ImmortalWrt-25.12.1-AWG-x86_64-APKs
-          path: sdk/bin/packages/x86_64/amneziawg/*.apk
+          path: sdk/bin/**/*.apk
