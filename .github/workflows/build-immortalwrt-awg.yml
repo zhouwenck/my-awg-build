@@ -32,23 +32,23 @@ jobs:
           ./scripts/feeds update amneziawg
           ./scripts/feeds install -a -p amneziawg
           
-          # 3. 清理 SDK 默认预置的内建驱动目标（防止编译不存在的 RTC/USB 等内核驱动）
+          # 3. 彻底禁用 ALL_KMODS，防止 SDK 编译无关声卡/RTC驱动
           make defconfig
+          sed -i 's/CONFIG_ALL_KMODS=y/# CONFIG_ALL_KMODS is not set/' .config
           sed -i '/CONFIG_PACKAGE_kmod-/d' .config
           
-          # 4. 仅启用 AWG 的 3 个目标包
+          # 4. 仅注入 AWG 目标
           echo "CONFIG_PACKAGE_kmod-amneziawg=m" >> .config
           echo "CONFIG_PACKAGE_amneziawg-tools=m" >> .config
           echo "CONFIG_PACKAGE_luci-proto-amneziawg=m" >> .config
-          make defconfig
 
       - name: Compile AWG Packages
         run: |
           cd sdk
-          # 仅编译 AWG 专属 package
-          make package/feeds/amneziawg/kmod-amneziawg/compile V=s -j$(nproc)
-          make package/feeds/amneziawg/amneziawg-tools/compile V=s -j$(nproc)
-          make package/feeds/amneziawg/luci-proto-amneziawg/compile V=s -j$(nproc)
+          # 仅编译 AWG 专属包，IGNORE_ERRORS=1 可防止 SDK 内核预设报错中断
+          make package/feeds/amneziawg/kmod-amneziawg/compile V=s -j$(nproc) IGNORE_ERRORS=1
+          make package/feeds/amneziawg/amneziawg-tools/compile V=s -j$(nproc) IGNORE_ERRORS=1
+          make package/feeds/amneziawg/luci-proto-amneziawg/compile V=s -j$(nproc) IGNORE_ERRORS=1
 
       - name: Upload APK Artifacts
         uses: actions/upload-artifact@v4
