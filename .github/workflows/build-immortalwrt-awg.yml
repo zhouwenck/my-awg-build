@@ -1,16 +1,16 @@
 name: Build AmneziaWG for ImmortalWrt
 
 # 用法：
-# 1. 把本文件放到自己仓库的 .github/workflows/build-awg-immortalwrt.yml
-# 2. 仓库 -> Actions -> Build AmneziaWG for ImmortalWrt -> Run workflow
-# 3. 填入路由器的 target / subtarget（SSH 执行 . /etc/openwrt_release && echo $DISTRIB_TARGET）
-# 4. 在任务页面底部 Artifacts 下载 .apk 包
+# 1. 放到自己仓库的 .github/workflows/build-awg-immortalwrt.yml
+# 2. Actions -> Build AmneziaWG for ImmortalWrt -> Run workflow
+# 3. 填 target / subtarget（SSH: . /etc/openwrt_release && echo $DISTRIB_TARGET）
+# 4. 任务页底部 Artifacts 下载 .apk
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "ImmortalWrt 版本号（Status -> Overview 里能看到）"
+        description: "ImmortalWrt 版本号"
         required: true
         default: "25.12.1"
       target:
@@ -30,11 +30,73 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - name: 安装编译依赖
+      - uses: actions/checkout@v4
+
+      - name: 拉取 AmneziaWG 包源码
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang flex bison g++ gawk \
-            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+          set -e
+          git clone --depth=1 "${{ inputs.awg_repo }}" /tmp/awg
+          for p in kmod-amneziawg amneziawg-tools luci-proto-amneziawg luci-app-amneziawg; do
+            if [ -d "/tmp/awg/$p" ]; then
+              cp -r "/tmp/awg/$p" ./
+              echo "已加入包目录: $p"
+            fi
+          done
+          ls -d */ 
+
+      - name: 选择可用的 SDK 镜像 tag
+        id: pick
+        run: |
+          set -e
+          V="${{ inputs.version }}"
+          MINOR="$(echo "$V" | cut -d. -f1,2)"
+          T="${{ inputs.target }}-${{ inputs.subtarget }}"
+          for TAG in "$T-$V" "$T-$MINOR" "$T"; do
+            echo "检测 immortalwrt/sdk:$TAG ..."
+            if docker manifest inspect "immortalwrt/sdk:$TAG" >/dev/null 2>&1; then
+              echo "arch=$TAG" >> "$GITHUB_OUTPUT"
+              echo ">>> 使用 immortalwrt/sdk:$TAG"
+              exit 0
+            fi
+          done
+          echo "没有找到可用的 SDK 镜像，请检查 target/subtarget/version"
+          exit 1
+
+      - name: 编译
+        uses: immortalwrt/gh-action-sdk@master
+        env:
+          ARCH: ${{ steps.pick.outputs.arch }}
+          PACKAGES: kmod-amneziawg amneziawg-tools luci-proto-amneziawg
+          FEEDNAME: awg
+          IGNORE_ERRORS: 1
+          NO_REFRESH_CHECK: 1
+          NO_SHFMT_CHECK: 1
+          BUILD_LOG: 1
+          V: s
+
+      - name: 收集产物
+        run: |
+          mkdir -p out
+          find bin -type f \( -name "*amneziawg*.apk" -o -name "*amneziawg*.ipk" \) \
+            -exec cp -v {} out/ \; 2>/dev/null || true
+          echo "===== 产物列表 ====="
+          ls -lh out/ || true
+          test -n "$(ls -A out/ 2>/dev/null)"
+
+      - name: 上传
+        uses: actions/upload-artifact@v4
+        with:
+          name: amneziawg-${{ steps.pick.outputs.arch }}
+          path: out/*
+          if-no-files-found: error
+
+      - name: 上传编译日志（失败时排查用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: logs/
+          if-no-files-found: ignore            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
             python3 python3-setuptools rsync swig unzip zlib1g-dev file wget zstd curl
 
       - name: 下载并解压 ImmortalWrt SDK
