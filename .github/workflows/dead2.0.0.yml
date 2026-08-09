@@ -1,0 +1,92 @@
+name: Probe - daed with dae 2.0.0 core
+
+on:
+  workflow_dispatch:
+    inputs:
+      dae_ref:
+        description: 'dae core 的 tag 或分支'
+        required: true
+        default: 'v2.0.0'
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm make git
+
+      - name: Clone daed
+        run: |
+          git clone --recursive https://github.com/daeuniverse/daed
+          cd daed
+          echo "=== daed 原本锁定的 submodule ===" | tee /tmp/00-original.log
+          git submodule status --recursive | tee -a /tmp/00-original.log
+
+      - name: Switch dae-core to ${{ inputs.dae_ref }}
+        working-directory: daed/wing/dae-core
+        run: |
+          git fetch --tags origin
+          git checkout ${{ inputs.dae_ref }}
+          git submodule update --init --recursive
+          echo "=== 切换后的 dae-core ===" | tee /tmp/01-core.log
+          git log -1 --oneline | tee -a /tmp/01-core.log
+          go version | tee -a /tmp/01-core.log
+          echo "--- dae go.mod 头部 ---" | tee -a /tmp/01-core.log
+          head -5 go.mod | tee -a /tmp/01-core.log
+
+      - name: Build eBPF objects
+        id: ebpf
+        continue-on-error: true
+        working-directory: daed/wing/dae-core
+        run: make ebpf 2>&1 | tee /tmp/02-ebpf.log
+
+      - name: go mod tidy
+        id: tidy
+        continue-on-error: true
+        working-directory: daed/wing
+        run: |
+          touch dae-core/control/bpf_bpfeb.o dae-core/control/bpf_bpfel.o || true
+          go mod edit -replace github.com/daeuniverse/dae=./dae-core
+          go mod tidy 2>&1 | tee /tmp/03-tidy.log
+
+      - name: go build
+        id: gobuild
+        continue-on-error: true
+        working-directory: daed/wing
+        run: go build ./... 2>&1 | tee /tmp/04-build.log
+
+      - name: Result
+        run: |
+          {
+            echo "## 探测结果：dae-core = ${{ inputs.dae_ref }}"
+            echo ""
+            echo "| 阶段 | 结果 |"
+            echo "|---|---|"
+            echo "| eBPF 编译 | ${{ steps.ebpf.outcome }} |"
+            echo "| go mod tidy | ${{ steps.tidy.outcome }} |"
+            echo "| go build | ${{ steps.gobuild.outcome }} |"
+            echo ""
+            if [ "${{ steps.gobuild.outcome }}" = "success" ]; then
+              echo "**有戏** — dae-wing 能对着这个版本的 dae 编译通过。"
+            else
+              echo "**编不过** — 错误摘要如下，完整日志在 artifact 里。"
+              echo ""
+              echo '```'
+              tail -60 /tmp/04-build.log 2>/dev/null || tail -40 /tmp/03-tidy.log 2>/dev/null || echo "(无日志)"
+              echo '```'
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-logs-${{ inputs.dae_ref }}
+          path: /tmp/*.log
