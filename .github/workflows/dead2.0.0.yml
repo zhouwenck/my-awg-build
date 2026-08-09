@@ -1,21 +1,26 @@
-name: Probe v2 - daed with dae 2.0.0 core
+name: Build daed with dae 2.0.0
 
 on:
   workflow_dispatch:
     inputs:
       dae_ref:
-        description: 'dae core 的 tag 或分支'
+        description: 'dae core tag'
         required: true
         default: 'v2.0.0'
 
 jobs:
-  probe:
+  build:
     runs-on: ubuntu-24.04
     steps:
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version: 'stable'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: npm install -g pnpm
 
       - name: Install toolchain
         run: |
@@ -33,27 +38,21 @@ jobs:
           git submodule update --init --recursive
           git log -1 --oneline | tee /tmp/01-core.log
 
-      - name: Inspect wing build system
-        working-directory: daed/wing
+      - name: Inspect daed root build system
+        working-directory: daed
         run: |
           {
-            echo "=== Makefile 目标 ==="
-            grep -nE '^[a-zA-Z0-9_.-]+:' Makefile 2>/dev/null || echo "(无 Makefile)"
+            echo "=== 根 Makefile 目标 ==="
+            grep -nE '^[a-zA-Z0-9_.-]+:' Makefile 2>/dev/null || echo "(无根 Makefile)"
             echo
-            echo "=== go:generate 指令 ==="
-            grep -rn "go:generate" --include="*.go" . | head -20
+            echo "=== 根目录 ==="
+            ls -la
             echo
-            echo "=== global 包在哪 ==="
-            find . -type d -name global -not -path "./dae-core/*"
-            echo
-            echo "=== global 包内容 ==="
-            ls -la graphql/service/config/global/ 2>/dev/null || echo "(该路径不存在)"
-            echo
-            echo "=== config 包 import 了什么 ==="
-            head -20 graphql/service/config/resolver.go
+            echo "=== package.json scripts ==="
+            grep -A15 '"scripts"' package.json 2>/dev/null || echo "(无 package.json)"
           } 2>&1 | tee /tmp/02-inspect.log
 
-      - name: Build eBPF objects
+      - name: Build eBPF
         id: ebpf
         continue-on-error: true
         working-directory: daed/wing/dae-core
@@ -61,64 +60,64 @@ jobs:
           set -o pipefail
           make ebpf 2>&1 | tee /tmp/03-ebpf.log
 
-      - name: Prepare deps
-        id: deps
+      - name: Build daed
+        id: build
         continue-on-error: true
-        working-directory: daed/wing
+        working-directory: daed
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
         run: |
           set -o pipefail
-          touch dae-core/control/bpf_bpfeb.o dae-core/control/bpf_bpfel.o || true
-          go mod edit -replace github.com/daeuniverse/dae=./dae-core
-          go mod tidy 2>&1 | tee /tmp/04-tidy.log
+          go mod edit -replace github.com/daeuniverse/dae=./dae-core -C wing || true
+          make deps 2>&1 | tee /tmp/04-build.log
+          make 2>&1 | tee -a /tmp/04-build.log
 
-      - name: Run code generation
-        id: gen
-        continue-on-error: true
-        working-directory: daed/wing
-        run: |
-          set -o pipefail
-          if grep -qE '^deps:' Makefile 2>/dev/null; then
-            echo "--- make deps ---" | tee /tmp/05-gen.log
-            make deps 2>&1 | tee -a /tmp/05-gen.log
-          else
-            echo "--- go generate ./... ---" | tee /tmp/05-gen.log
-            go generate ./... 2>&1 | tee -a /tmp/05-gen.log
-          fi
-          echo "--- 生成后的 global 包 ---" | tee -a /tmp/05-gen.log
-          ls -la graphql/service/config/global/ 2>&1 | tee -a /tmp/05-gen.log
-
-      - name: go build
-        id: gobuild
-        continue-on-error: true
-        working-directory: daed/wing
-        run: |
-          set -o pipefail
-          go build ./... 2>&1 | tee /tmp/06-build.log
-
-      - name: Result
+      - name: Locate binary
+        if: always()
+        working-directory: daed
         run: |
           {
-            echo "## dae-core = ${{ inputs.dae_ref }}"
+            echo "=== 产物 ==="
+            find . -maxdepth 3 -type f -perm -u+x -size +5M -not -path "*/node_modules/*" -not -path "*/.git/*"
+          } 2>&1 | tee /tmp/05-artifact.log
+
+      - name: Verify
+        if: always()
+        working-directory: daed
+        run: |
+          B=$(find . -maxdepth 3 -type f -name daed -perm -u+x | head -1)
+          if [ -n "$B" ]; then
+            file "$B" | tee -a /tmp/05-artifact.log
+            "$B" --version 2>&1 | tee -a /tmp/05-artifact.log || true
+            mkdir -p /tmp/out && cp "$B" /tmp/out/
+          else
+            echo "没找到 daed 二进制" | tee -a /tmp/05-artifact.log
+          fi
+
+      - name: Result
+        if: always()
+        run: |
+          {
+            echo "## daed + dae-core ${{ inputs.dae_ref }}"
             echo ""
             echo "| 阶段 | 结果 |"
             echo "|---|---|"
             echo "| eBPF | ${{ steps.ebpf.outcome }} |"
-            echo "| mod tidy | ${{ steps.deps.outcome }} |"
-            echo "| 代码生成 | ${{ steps.gen.outcome }} |"
-            echo "| go build | ${{ steps.gobuild.outcome }} |"
+            echo "| build | ${{ steps.build.outcome }} |"
             echo ""
-            if [ "${{ steps.gobuild.outcome }}" = "success" ]; then
-              echo "**编译通过**"
-            else
-              echo '```'
-              tail -40 /tmp/06-build.log 2>/dev/null || echo "(无日志)"
-              echo '```'
-            fi
+            echo '```'
+            cat /tmp/05-artifact.log 2>/dev/null | tail -20
+            echo '```'
           } >> $GITHUB_STEP_SUMMARY
 
-      - name: Upload logs
+      - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: probe2-${{ inputs.dae_ref }}
-          path: /tmp/*.log
+          name: daed-${{ inputs.dae_ref }}
+          path: |
+            /tmp/*.log
+            /tmp/out/*
+          retention-days: 30
