@@ -11,6 +11,10 @@ on:
         description: 'apk 包版本'
         required: true
         default: '2.0.0'
+      web_ref:
+        description: '前端 web.zip 取哪个 daed release（上游实际存在的版本）'
+        required: true
+        default: '1.27.0'
 
 env:
   CGO_ENABLED: '0'
@@ -110,14 +114,15 @@ jobs:
           MK=feeds/packages/net/daed/Makefile
           mkdir -p prebuilt && cp /tmp/out/daed prebuilt/daed
 
-          cp "$MK" /tmp/07-feed-makefile-orig.txt
-          find feeds/packages/net/daed -type f | tee -a /tmp/07-feed-makefile-orig.txt
+          cp "$MK" /tmp/07-feed-makefile.log
+          echo "=== files ===" >> /tmp/07-feed-makefile.log
+          find feeds/packages/net/daed -type f >> /tmp/07-feed-makefile.log
 
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${{ inputs.pkgver }}/" "$MK"
           sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=1/" "$MK"
 
           # 追加覆盖：不编译 Go，直接塞入我们编好的二进制。
-          # Build/Compile 在规则执行时才展开，所以放在 BuildPackage 之后依然生效。
+          # Build/Compile 在规则执行时才展开，放在 BuildPackage 之后依然生效。
           cat > /tmp/override.mk <<'EOF'
 
           # ---- 使用预编译 daed（dae 2.0.0 核心）----
@@ -146,6 +151,15 @@ jobs:
             cat -A /tmp/override.mk
           } 2>&1 | tee /tmp/08-patch.log
 
+      - name: Pre-seed daed web zip
+        working-directory: sdk
+        run: |
+          set -o pipefail
+          mkdir -p dl
+          wget -q "https://github.com/daeuniverse/daed/releases/download/v${{ inputs.web_ref }}/web.zip" \
+            -O "dl/daed-web-${{ inputs.pkgver }}.zip"
+          ls -l dl/ | tee /tmp/12-webzip.log
+
       - name: Build 5 packages
         working-directory: sdk
         run: |
@@ -167,8 +181,10 @@ jobs:
         if: always()
         working-directory: sdk
         run: |
-          echo "=== 产物 ===" | tee /tmp/11-output.log
-          find bin/packages -name '*daed*' 2>/dev/null | tee -a /tmp/11-output.log || echo "无产物"
+          echo "=== 产物 ===" > /tmp/11-output.log
+          find bin/packages -name '*daed*' >> /tmp/11-output.log 2>/dev/null || true
+          cat /tmp/11-output.log
+          exit 0
 
       - name: Result
         if: always()
