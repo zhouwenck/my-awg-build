@@ -1,4 +1,4 @@
-name: Build daed with dae 2.0.0
+name: Build daed 2.0.0 (dae v2.0.0 core) — 5 apks for ImmortalWrt 25.12.1 x86_64
 
 on:
   workflow_dispatch:
@@ -7,13 +7,22 @@ on:
         description: 'dae core tag'
         required: true
         default: 'v2.0.0'
+      pkgver:
+        description: 'apk 包版本'
+        required: true
+        default: '2.0.0'
+
+env:
+  CGO_ENABLED: '0'
+  SDK_URL: https://downloads.immortalwrt.org/releases/25.12.1/targets/x86/64/immortalwrt-sdk-25.12.1-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    env:
-      CGO_ENABLED: '0'
     steps:
+
+      # ════════ 第一部分：构建 daed 二进制（dae 2.0.0 核心）════════
+
       - uses: actions/setup-go@v5
         with:
           go-version: 'stable'
@@ -21,9 +30,15 @@ jobs:
         with:
           node-version: '22'
       - run: npm install -g pnpm
-      - run: sudo apt-get update && sudo apt-get install -y clang llvm make git gzip
 
-      - name: Clone
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm make git gzip \
+            build-essential flex bison gawk gettext libncurses-dev \
+            libssl-dev python3 rsync unzip zlib1g-dev file wget zstd swig time
+
+      - name: Clone daed
         run: git clone --recursive https://github.com/daeuniverse/daed
 
       - name: Switch dae-core to ${{ inputs.dae_ref }}
@@ -45,20 +60,17 @@ jobs:
         run: |
           set -o pipefail
           touch dae-core/control/bpf_bpfeb.o dae-core/control/bpf_bpfel.o
-          echo "=== 原 go.mod replace ===" | tee /tmp/03-mod.log
-          grep -n replace go.mod 2>&1 | tee -a /tmp/03-mod.log || true
+          grep -n replace go.mod | tee /tmp/03-mod.log || true
           go mod edit -replace github.com/daeuniverse/dae=./dae-core
           go mod tidy 2>&1 | tail -5 | tee -a /tmp/03-mod.log
 
-      - name: Fix lockfile
+      - name: Fix pnpm lockfile
         working-directory: daed
         run: |
           set -o pipefail
           pnpm install --no-frozen-lockfile 2>&1 | tail -20 | tee /tmp/04-pnpm.log
 
       - name: Build daed
-        id: build
-        continue-on-error: true
         working-directory: daed
         run: |
           set -o pipefail
@@ -69,33 +81,107 @@ jobs:
             VERSION=daed-dae${{ inputs.dae_ref }} \
             daed 2>&1 | tail -80 | tee /tmp/05-build.log
 
-      - name: Verify
-        if: always()
+      - name: Gate — 核心必须是 ${{ inputs.dae_ref }}
         working-directory: daed
         run: |
+          set -e
+          CORE=$(git -C wing/dae-core describe --tags --always)
+          { echo "dae-core = $CORE"; file daed; ./daed --version; } | tee /tmp/06-verify.log
+          if [ "$CORE" != "${{ inputs.dae_ref }}" ]; then
+            echo "::error::核心被重置成 $CORE，产物作废"
+            exit 1
+          fi
+          mkdir -p /tmp/out && cp daed /tmp/out/
+
+      # ════════ 第二部分：打成 5 个 apk ════════
+
+      - name: Download SDK
+        run: |
+          wget -q "$SDK_URL" -O sdk.tar.zst
+          mkdir sdk && tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
+
+      - name: Update feeds
+        working-directory: sdk
+        run: ./scripts/feeds update -a && ./scripts/feeds install -a
+
+      - name: Patch feed daed package
+        working-directory: sdk
+        run: |
+          MK=feeds/packages/net/daed/Makefile
+          mkdir -p prebuilt && cp /tmp/out/daed prebuilt/daed
+
+          cp "$MK" /tmp/07-feed-makefile-orig.txt
+          find feeds/packages/net/daed -type f | tee -a /tmp/07-feed-makefile-orig.txt
+
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${{ inputs.pkgver }}/" "$MK"
+          sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=1/" "$MK"
+
+          # 追加覆盖：不编译 Go，直接塞入我们编好的二进制。
+          # Build/Compile 在规则执行时才展开，所以放在 BuildPackage 之后依然生效。
+          cat > /tmp/override.mk <<'EOF'
+
+          # ---- 使用预编译 daed（dae 2.0.0 核心）----
+          define Build/Prepare
+          >mkdir -p $(PKG_BUILD_DIR)
+          endef
+
+          define Build/Configure
+          endef
+
+          define Build/Compile
+          >mkdir -p $(GO_PKG_BUILD_BIN_DIR)
+          >$(CP) $(TOPDIR)/prebuilt/daed $(GO_PKG_BUILD_BIN_DIR)/daed
+          >chmod 755 $(GO_PKG_BUILD_BIN_DIR)/daed
+          endef
+          EOF
+
+          sed -i 's/^>/\t/' /tmp/override.mk
+          cat /tmp/override.mk >> "$MK"
+
           {
-            echo "=== 构建后 dae-core 指向（必须是 ${{ inputs.dae_ref }}）==="
-            git -C wing/dae-core describe --tags --always
+            echo "=== 改后的版本字段 ==="
+            grep -E '^PKG_(NAME|VERSION|RELEASE)' "$MK"
             echo
-            echo "=== 产物 ==="
-            ls -lh daed 2>/dev/null || echo "没有 daed"
-            file daed 2>/dev/null || true
-            echo
-            echo "=== 版本 ==="
-            ./daed --version 2>&1 || true
-          } 2>&1 | tee /tmp/06-verify.log
-          mkdir -p /tmp/out && cp daed /tmp/out/ 2>/dev/null || true
+            echo "=== 追加的覆盖块（^I 应为 TAB）==="
+            cat -A /tmp/override.mk
+          } 2>&1 | tee /tmp/08-patch.log
+
+      - name: Build 5 packages
+        working-directory: sdk
+        run: |
+          set -o pipefail
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_daed=m
+          CONFIG_PACKAGE_daed-geoip=m
+          CONFIG_PACKAGE_daed-geosite=m
+          CONFIG_PACKAGE_luci-app-daed=m
+          CONFIG_PACKAGE_luci-i18n-daed-zh-cn=m
+          EOF
+          make defconfig
+          make package/feeds/packages/daed/compile V=s -j$(nproc) 2>&1 \
+            | tail -60 | tee /tmp/09-daed.log
+          make package/feeds/luci/luci-app-daed/compile V=s -j$(nproc) 2>&1 \
+            | tail -40 | tee /tmp/10-luci.log
+
+      - name: List output
+        if: always()
+        working-directory: sdk
+        run: |
+          echo "=== 产物 ===" | tee /tmp/11-output.log
+          find bin/packages -name '*daed*' 2>/dev/null | tee -a /tmp/11-output.log || echo "无产物"
 
       - name: Result
         if: always()
         run: |
           {
-            echo "## daed + dae-core ${{ inputs.dae_ref }}"
-            echo ""
-            echo "build: ${{ steps.build.outcome }}"
+            echo "## daed ${{ inputs.pkgver }} / dae-core ${{ inputs.dae_ref }}"
             echo ""
             echo '```'
             cat /tmp/06-verify.log 2>/dev/null
+            echo '```'
+            echo ""
+            echo '```'
+            cat /tmp/11-output.log 2>/dev/null
             echo '```'
           } >> $GITHUB_STEP_SUMMARY
 
@@ -103,8 +189,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: daed-${{ inputs.dae_ref }}
+          name: daed-${{ inputs.pkgver }}-x86_64
           path: |
             /tmp/*.log
-            /tmp/out/*
+            /tmp/out/daed
+            sdk/bin/packages/x86_64/*/*daed*.apk
           retention-days: 30
