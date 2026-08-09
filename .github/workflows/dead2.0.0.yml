@@ -111,19 +111,17 @@ jobs:
       - name: Patch feed daed package
         working-directory: sdk
         run: |
+          set -e
           MK=feeds/packages/net/daed/Makefile
           mkdir -p prebuilt && cp /tmp/out/daed prebuilt/daed
 
           cp "$MK" /tmp/07-feed-makefile.log
 
-          # 版本号；源码与前端 zip 一律不下载，改用桩文件
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${{ inputs.pkgver }}/" "$MK"
           sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=1/" "$MK"
           sed -i "s|^PKG_MIRROR_HASH:=.*|PKG_MIRROR_HASH:=skip|" "$MK"
           sed -i "s|^PKG_BUILD_DEPENDS:=.*|PKG_BUILD_DEPENDS:=|" "$MK"
 
-          # 覆盖块：跳过 Go 编译，直接用预编译二进制。
-          # install 段照抄官方原文，只把二进制来源换掉。
           cat > /tmp/override.mk <<'EOF'
 
           # ---- 使用预编译 daed（dae 2.0.0 核心，前端已内嵌）----
@@ -137,6 +135,9 @@ jobs:
           define Build/Compile
           endef
 
+          define Build/Install
+          endef
+
           define Package/daed/install
           >$(INSTALL_DIR) $(1)/usr/bin
           >$(INSTALL_BIN) $(TOPDIR)/prebuilt/daed $(1)/usr/bin/daed
@@ -145,17 +146,25 @@ jobs:
           >$(INSTALL_DIR) $(1)/etc/init.d
           >$(INSTALL_BIN) $(CURDIR)/files/daed.init $(1)/etc/init.d/daed
           endef
-          EOF
 
+          EOF
           sed -i 's/^>/\t/' /tmp/override.mk
-          cat /tmp/override.mk >> "$MK"
+
+          # 关键：必须插在第一个 $(eval $(call ...) 之前。
+          # BuildPackage 展开时会把当时的 Build/* 定义烤进规则，之后再定义无效。
+          LINE=$(grep -n '^\$(eval \$(call ' "$MK" | head -1 | cut -d: -f1)
+          echo "插入位置：第 $LINE 行"
+          head -n $((LINE-1)) "$MK" > /tmp/mk.new
+          cat /tmp/override.mk >> /tmp/mk.new
+          tail -n +$LINE "$MK" >> /tmp/mk.new
+          mv /tmp/mk.new "$MK"
 
           {
             echo "=== 版本字段 ==="
             grep -E '^PKG_(NAME|VERSION|RELEASE|MIRROR_HASH|BUILD_DEPENDS)' "$MK"
             echo
-            echo "=== 覆盖块（^I 应为 TAB）==="
-            cat -A /tmp/override.mk
+            echo "=== Makefile 尾部（覆盖块应在 eval 之前）==="
+            tail -35 "$MK" | cat -A
           } 2>&1 | tee /tmp/08-patch.log
 
       - name: Pre-seed downloads
@@ -163,10 +172,8 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p dl
-          # 前端 zip：用 1.27.0 的真文件，HASH 校验能过
           wget -q "https://github.com/daeuniverse/daed/releases/download/v${{ inputs.web_ref }}/web.zip" \
             -O "dl/daed-web-${{ inputs.pkgver }}.zip"
-          # 源码 tarball：Build/Prepare 已被覆盖，用空桩即可（MIRROR_HASH 已设 skip）
           tar -cf - --files-from /dev/null | zstd -q -o "dl/daed-${{ inputs.pkgver }}.tar.zst"
           ls -l dl/ | tee /tmp/12-preseed.log
 
