@@ -1,0 +1,392 @@
+name: Build honk + luci-app-honk for ImmortalWrt 25.12.1 x86_64
+
+on:
+  workflow_dispatch:
+    inputs:
+      ver:
+        description: 'honk 版本（不带 v）'
+        required: true
+        default: '0.0.1.beta.41'
+      hash:
+        description: 'musl 包 sha256'
+        required: true
+        default: '9e3d88a18e00677d10169602f3f4a924effa773250f38c89252d68fc56f79f7f'
+
+env:
+  SDK_URL: https://downloads.immortalwrt.org/releases/25.12.1/targets/x86/64/immortalwrt-sdk-25.12.1-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison gawk gettext \
+            git libncurses-dev libssl-dev python3 rsync unzip zlib1g-dev \
+            file wget zstd swig time
+
+      - name: Download SDK
+        run: |
+          wget -q "$SDK_URL" -O sdk.tar.zst
+          mkdir sdk && tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
+
+      - name: Update feeds
+        working-directory: sdk
+        run: ./scripts/feeds update -a && ./scripts/feeds install -a
+
+      - name: Write honk package
+        working-directory: sdk
+        run: |
+          mkdir -p package/honk/files
+
+          cat > package/honk/Makefile <<'EOF'
+          include $(TOPDIR)/rules.mk
+
+          PKG_NAME:=honk
+          PKG_VERSION:=__VER__
+          PKG_RELEASE:=1
+
+          PKG_SOURCE:=honk-core-v$(PKG_VERSION)-x86_64-unknown-linux-musl.tar.gz
+          PKG_SOURCE_URL:=https://github.com/Glassyiris/honk/releases/download/v$(PKG_VERSION)
+          PKG_HASH:=__HASH__
+          PKG_BUILD_DIR:=$(BUILD_DIR)/honk-core-v$(PKG_VERSION)-x86_64-unknown-linux-musl
+
+          PKG_MAINTAINER:=local
+          PKG_LICENSE:=GPL-3.0-only
+          PKG_LICENSE_FILES:=LICENSE
+
+          RSTRIP:=:
+
+          include $(INCLUDE_DIR)/package.mk
+
+          define Package/honk
+            SECTION:=net
+            CATEGORY:=Network
+            TITLE:=eBPF transparent proxy with Clash API
+            URL:=https://github.com/Glassyiris/honk
+            DEPENDS:=@TARGET_x86_64 +ca-bundle +kmod-sched-core +kmod-sched-bpf +kmod-xdp-sockets-diag +kmod-veth +dae-geoip +dae-geosite
+          endef
+
+          define Package/honk/description
+            Rust eBPF transparent proxy inspired by dae and sing-box, with Clash API.
+          endef
+
+          define Build/Configure
+          endef
+
+          define Build/Compile
+          endef
+
+          define Package/honk/conffiles
+          /etc/honk/config.dae
+          endef
+
+          define Package/honk/install
+          >$(INSTALL_DIR) $(1)/usr/bin
+          >$(INSTALL_BIN) $(PKG_BUILD_DIR)/honk-core $(1)/usr/bin/honk-core
+          >$(INSTALL_DIR) $(1)/etc/init.d
+          >$(INSTALL_BIN) ./files/honk.init $(1)/etc/init.d/honk
+          >$(INSTALL_DIR) $(1)/etc/honk
+          >$(INSTALL_CONF) ./files/config.dae $(1)/etc/honk/config.dae
+          >if [ -d ./files/ui ]; then $(INSTALL_DIR) $(1)/etc/honk/ui; $(CP) ./files/ui/. $(1)/etc/honk/ui/; fi
+          endef
+
+          $(eval $(call BuildPackage,honk))
+          EOF
+
+          sed -i "s/__VER__/${{ inputs.ver }}/; s/__HASH__/${{ inputs.hash }}/" package/honk/Makefile
+          sed -i 's/^>/\t/' package/honk/Makefile
+
+          cat > package/honk/files/honk.init <<'EOF'
+          #!/bin/sh /etc/rc.common
+          USE_PROCD=1
+          START=99
+          STOP=10
+
+          start_service() {
+              [ -f /sys/fs/cgroup/cgroup.controllers ] || mount -t cgroup2 none /sys/fs/cgroup
+              mkdir -p /etc/honk
+
+              procd_open_instance honk
+              procd_set_param command /bin/sh -c \
+                  "cd /etc/honk && exec /usr/bin/honk-core -c /etc/honk/config.dae"
+              procd_set_param respawn 3600 5 5
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_set_param limits nofile="1048576 1048576"
+              procd_close_instance
+          }
+
+          reload_service() {
+              procd_send_signal honk "*" HUP
+          }
+          EOF
+
+          cat > package/honk/files/config.dae <<'EOF'
+          # honk 配置骨架 —— 节点、分组、分流请自行补全
+          # 完整示例见仓库根目录 example.dae
+
+          global {
+              tproxy_port: 12345
+              log_level: info
+              lan_interface: br-lan
+              wan_interface: auto
+              auto_config_kernel_parameter: true
+              dial_mode: domain++
+          }
+
+          experimental {
+              clash_api {
+                  external_controller: '0.0.0.0:9090'
+                  external_ui: '/etc/honk/ui'
+                  secret: 'changeme'
+                  default_mode: 'rule'
+              }
+              cache_file: '/etc/honk/cache.db'
+          }
+          EOF
+
+          echo "=== 确认 TAB ==="; cat -A package/honk/Makefile | grep INSTALL_BIN
+
+      - name: Write luci-app-honk
+        working-directory: sdk
+        run: |
+          B=package/luci-app-honk
+          mkdir -p $B/htdocs/luci-static/resources/view/honk
+          mkdir -p $B/root/usr/share/luci/menu.d
+          mkdir -p $B/root/usr/share/rpcd/acl.d
+
+          cat > $B/Makefile <<'EOF'
+          include $(TOPDIR)/rules.mk
+
+          LUCI_TITLE:=LuCI support for honk
+          LUCI_DEPENDS:=+honk
+          LUCI_PKGARCH:=all
+
+          PKG_VERSION:=1.0
+          PKG_RELEASE:=1
+          PKG_LICENSE:=GPL-3.0-only
+
+          include $(TOPDIR)/feeds/luci/luci.mk
+
+          # call BuildPackage - OpenWrt buildroot signature
+          EOF
+
+          cat > $B/root/usr/share/luci/menu.d/luci-app-honk.json <<'EOF'
+          {
+            "admin/services/honk": {
+              "title": "honk",
+              "order": 30,
+              "action": { "type": "view", "path": "honk/config" },
+              "depends": { "acl": [ "luci-app-honk" ] }
+            }
+          }
+          EOF
+
+          cat > $B/root/usr/share/rpcd/acl.d/luci-app-honk.json <<'EOF'
+          {
+            "luci-app-honk": {
+              "description": "Grant access to honk",
+              "read": {
+                "file": {
+                  "/etc/honk/config.dae": [ "read" ],
+                  "/usr/bin/honk-core": [ "exec" ],
+                  "/sbin/logread": [ "exec" ]
+                },
+                "ubus": { "service": [ "list" ] }
+              },
+              "write": {
+                "file": {
+                  "/etc/honk/config.dae": [ "write" ],
+                  "/etc/init.d/honk": [ "exec" ]
+                }
+              }
+            }
+          }
+          EOF
+
+          cat > $B/htdocs/luci-static/resources/view/honk/config.js <<'EOF'
+          'use strict';
+          'require view';
+          'require fs';
+          'require ui';
+          'require rpc';
+          'require poll';
+
+          var CONF = '/etc/honk/config.dae';
+          var INIT = '/etc/init.d/honk';
+
+          var callServiceList = rpc.declare({
+              object: 'service',
+              method: 'list',
+              params: [ 'name' ],
+              expect: { '': {} }
+          });
+
+          function isRunning(res) {
+              try { return !!res['honk']['instances']['honk']['running']; }
+              catch (e) { return false; }
+          }
+
+          function paintStatus(running) {
+              var el = document.getElementById('honk_status');
+              if (!el) return;
+              el.innerHTML = '';
+              el.appendChild(E('span', {
+                  'style': 'color:' + (running ? '#0a0' : '#a00') + ';font-weight:bold'
+              }, running ? '运行中' : '未运行'));
+          }
+
+          function refreshStatus() {
+              return callServiceList('honk')
+                  .then(function(res) { paintStatus(isRunning(res)); })
+                  .catch(function() { paintStatus(false); });
+          }
+
+          function act(cmd) {
+              return fs.exec(INIT, [ cmd ]).then(function() {
+                  ui.addNotification(null, E('p', 'honk: ' + cmd + ' 已执行'), 'info');
+                  return refreshStatus();
+              }).catch(function(err) {
+                  ui.addNotification(null, E('p', '执行失败: ' + err.message), 'error');
+              });
+          }
+
+          function saveConf(alsoReload) {
+              var box = document.getElementById('honk_conf');
+              if (!box) return Promise.resolve();
+              return fs.write(CONF, box.value.replace(/\r\n/g, '\n')).then(function() {
+                  ui.addNotification(null, E('p', '配置已保存'), 'info');
+                  if (alsoReload) return act('reload');
+              }).catch(function(err) {
+                  ui.addNotification(null, E('p', '保存失败: ' + err.message), 'error');
+              });
+          }
+
+          function refreshLog() {
+              return fs.exec('/sbin/logread', [ '-e', 'honk' ]).then(function(r) {
+                  var box = document.getElementById('honk_log');
+                  if (!box) return;
+                  var lines = (r.stdout || '').trim().split('\n');
+                  box.value = lines.slice(-200).join('\n');
+                  box.scrollTop = box.scrollHeight;
+              }).catch(function() {});
+          }
+
+          function btn(label, style, fn) {
+              return E('button', {
+                  'class': 'btn cbi-button-' + style,
+                  'style': 'margin-right:6px',
+                  'click': ui.createHandlerFn(this, fn)
+              }, label);
+          }
+
+          return view.extend({
+              load: function() {
+                  return Promise.all([
+                      fs.read(CONF).catch(function() { return '# 配置文件不存在\n'; }),
+                      callServiceList('honk').catch(function() { return {}; })
+                  ]);
+              },
+
+              render: function(data) {
+                  var conf = data[0] || '';
+                  var running = isRunning(data[1]);
+                  var panel = 'http://' + window.location.hostname + ':9090/ui';
+
+                  poll.add(refreshStatus, 5);
+                  poll.add(refreshLog, 10);
+
+                  return E('div', { 'class': 'cbi-map' }, [
+                      E('h2', {}, 'honk'),
+                      E('div', { 'class': 'cbi-map-descr' },
+                          '基于 eBPF 的透明代理。配置文件 ' + CONF +
+                          '，节点与分流请在下方编辑；节点管理也可用 zashboard 面板。'),
+
+                      E('div', { 'class': 'cbi-section' }, [
+                          E('h3', {}, '服务'),
+                          E('div', { 'class': 'cbi-value' }, [
+                              E('label', { 'class': 'cbi-value-title' }, '运行状态'),
+                              E('div', { 'class': 'cbi-value-field', 'id': 'honk_status' },
+                                  E('span', {
+                                      'style': 'color:' + (running ? '#0a0' : '#a00') + ';font-weight:bold'
+                                  }, running ? '运行中' : '未运行'))
+                          ]),
+                          E('div', { 'class': 'cbi-value' }, [
+                              E('label', { 'class': 'cbi-value-title' }, '操作'),
+                              E('div', { 'class': 'cbi-value-field' }, [
+                                  btn('启动', 'apply', function() { return act('start'); }),
+                                  btn('停止', 'reset', function() { return act('stop'); }),
+                                  btn('重启', 'action', function() { return act('restart'); }),
+                                  btn('热重载', 'apply', function() { return act('reload'); })
+                              ])
+                          ]),
+                          E('div', { 'class': 'cbi-value' }, [
+                              E('label', { 'class': 'cbi-value-title' }, '控制面板'),
+                              E('div', { 'class': 'cbi-value-field' },
+                                  E('a', { 'href': panel, 'target': '_blank',
+                                           'class': 'btn cbi-button-action' }, '打开 zashboard'))
+                          ])
+                      ]),
+
+                      E('div', { 'class': 'cbi-section' }, [
+                          E('h3', {}, '配置文件'),
+                          E('textarea', {
+                              'id': 'honk_conf',
+                              'style': 'width:100%;height:480px;font-family:monospace;font-size:13px',
+                              'spellcheck': 'false'
+                          }, conf),
+                          E('div', { 'style': 'margin-top:8px' }, [
+                              btn('保存', 'save', function() { return saveConf(false); }),
+                              btn('保存并热重载', 'apply', function() { return saveConf(true); })
+                          ])
+                      ]),
+
+                      E('div', { 'class': 'cbi-section' }, [
+                          E('h3', {}, '日志'),
+                          E('textarea', {
+                              'id': 'honk_log',
+                              'readonly': 'readonly',
+                              'style': 'width:100%;height:260px;font-family:monospace;font-size:12px'
+                          }, '')
+                      ])
+                  ]);
+              },
+
+              handleSave: null,
+              handleSaveApply: null,
+              handleReset: null
+          });
+          EOF
+
+          echo "=== 文件清单 ==="; find $B -type f
+
+      - name: Bundle zashboard UI
+        continue-on-error: true
+        working-directory: sdk
+        run: |
+          wget -q https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip -O /tmp/ui.zip
+          unzip -q /tmp/ui.zip -d /tmp/uiraw
+          mkdir -p package/honk/files/ui
+          if [ -d /tmp/uiraw/dist ]; then cp -r /tmp/uiraw/dist/. package/honk/files/ui/; \
+          else cp -r /tmp/uiraw/. package/honk/files/ui/; fi
+          ls package/honk/files/ui | head
+
+      - name: Build
+        working-directory: sdk
+        run: |
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_honk=m
+          CONFIG_PACKAGE_luci-app-honk=m
+          EOF
+          make defconfig
+          make package/honk/compile V=s -j$(nproc)
+          make package/luci-app-honk/compile V=s -j$(nproc)
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: honk-apk-${{ inputs.ver }}
+          path: sdk/bin/packages/x86_64/*/*honk*.apk
+          retention-days: 30
