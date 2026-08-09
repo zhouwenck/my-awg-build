@@ -1,11 +1,18 @@
-name: Inspect daed build system
+name: Build daed with dae 2.0.0
 
 on:
   workflow_dispatch:
+    inputs:
+      dae_ref:
+        description: 'dae core tag'
+        required: true
+        default: 'v2.0.0'
 
 jobs:
-  inspect:
+  build:
     runs-on: ubuntu-24.04
+    env:
+      CGO_ENABLED: '0'
     steps:
       - uses: actions/setup-go@v5
         with:
@@ -14,58 +21,90 @@ jobs:
         with:
           node-version: '22'
       - run: npm install -g pnpm
-      - run: sudo apt-get update && sudo apt-get install -y clang llvm make git
+      - run: sudo apt-get update && sudo apt-get install -y clang llvm make git gzip
 
       - name: Clone
         run: git clone --recursive https://github.com/daeuniverse/daed
 
-      - name: Dump Makefiles
-        working-directory: daed
+      - name: Switch dae-core to ${{ inputs.dae_ref }}
+        working-directory: daed/wing/dae-core
         run: |
-          {
-            echo "########## 根 Makefile ##########"
-            cat -n Makefile
-            echo
-            echo "########## .gitmodules.d.mk ##########"
-            cat .gitmodules.d.mk
-            echo
-            echo "########## wing/Makefile ##########"
-            cat -n wing/Makefile
-            echo
-            echo "########## Dockerfile（官方构建流程参考）##########"
-            cat Dockerfile
-          } 2>&1 | tee /tmp/10-makefiles.log
+          git fetch --tags origin
+          git checkout ${{ inputs.dae_ref }}
+          git submodule update --init --recursive
+          git describe --tags --always | tee /tmp/01-core.log
 
-      - name: Try official build (v1.1.0 core, 验证工具链)
-        id: try
-        continue-on-error: true
-        working-directory: daed
-        env:
-          CGO_ENABLED: '0'
+      - name: Build eBPF
+        working-directory: daed/wing/dae-core
         run: |
           set -o pipefail
-          make daed 2>&1 | tail -100 | tee /tmp/11-make-daed.log
+          make ebpf 2>&1 | tee /tmp/02-ebpf.log
 
-      - name: What got produced
+      - name: Wire dae-core into wing
+        working-directory: daed/wing
+        run: |
+          set -o pipefail
+          touch dae-core/control/bpf_bpfeb.o dae-core/control/bpf_bpfel.o
+          echo "=== 原 go.mod replace ===" | tee /tmp/03-mod.log
+          grep -n replace go.mod 2>&1 | tee -a /tmp/03-mod.log || true
+          go mod edit -replace github.com/daeuniverse/dae=./dae-core
+          go mod tidy 2>&1 | tail -5 | tee -a /tmp/03-mod.log
+
+      - name: Fix lockfile
+        working-directory: daed
+        run: |
+          set -o pipefail
+          pnpm install --no-frozen-lockfile 2>&1 | tail -20 | tee /tmp/04-pnpm.log
+
+      - name: Build daed
+        id: build
+        continue-on-error: true
+        working-directory: daed
+        run: |
+          set -o pipefail
+          SKIP_SUBMODULES=1 make \
+            PFLAGS="CI=false HUSKY=0" \
+            APPNAME=daed \
+            OUTPUT=daed \
+            VERSION=daed-dae${{ inputs.dae_ref }} \
+            daed 2>&1 | tail -80 | tee /tmp/05-build.log
+
+      - name: Verify
         if: always()
         working-directory: daed
         run: |
           {
-            echo "=== 可执行产物 ==="
-            find . -maxdepth 3 -type f -perm -u+x -size +3M \
-              -not -path "*/node_modules/*" -not -path "*/.git/*"
-            echo
-            echo "=== dist 在哪 ==="
-            find . -maxdepth 4 -type d -name dist -not -path "*/node_modules/*"
-            echo
-            echo "=== 构建后 dae-core 指向 ==="
+            echo "=== 构建后 dae-core 指向（必须是 ${{ inputs.dae_ref }}）==="
             git -C wing/dae-core describe --tags --always
-          } 2>&1 | tee /tmp/12-output.log
+            echo
+            echo "=== 产物 ==="
+            ls -lh daed 2>/dev/null || echo "没有 daed"
+            file daed 2>/dev/null || true
+            echo
+            echo "=== 版本 ==="
+            ./daed --version 2>&1 || true
+          } 2>&1 | tee /tmp/06-verify.log
+          mkdir -p /tmp/out && cp daed /tmp/out/ 2>/dev/null || true
+
+      - name: Result
+        if: always()
+        run: |
+          {
+            echo "## daed + dae-core ${{ inputs.dae_ref }}"
+            echo ""
+            echo "build: ${{ steps.build.outcome }}"
+            echo ""
+            echo '```'
+            cat /tmp/06-verify.log 2>/dev/null
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
 
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: daed-inspect
-          path: /tmp/*.log
+          name: daed-${{ inputs.dae_ref }}
+          path: |
+            /tmp/*.log
+            /tmp/out/*
           retention-days: 30
