@@ -1,4 +1,4 @@
-name: Build dae 2.0.0 for ImmortalWrt 25.12.1 x86_64
+name: Build dae 2.0.0-1 for ImmortalWrt 25.12.1 x86_64
 
 on:
   workflow_dispatch:
