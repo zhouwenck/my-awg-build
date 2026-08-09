@@ -1,4 +1,4 @@
-name: Build daed 2.0.0 (dae v2.0.0 core) — 5 apks for ImmortalWrt 25.12.1 x86_64
+name: Build daed 1.28 (dae v2.0.0 core) — 5 apks for ImmortalWrt 25.12.1 x86_64
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       pkgver:
         description: 'apk 包版本'
         required: true
-        default: '2.0.0'
+        default: '1.28'
       web_ref:
         description: '前端 web.zip 取哪个 daed release'
         required: true
@@ -138,6 +138,9 @@ jobs:
           define Build/Install
           endef
 
+          define Build/InstallDev
+          endef
+
           define Package/daed/install
           >$(INSTALL_DIR) $(1)/usr/bin
           >$(INSTALL_BIN) $(TOPDIR)/prebuilt/daed $(1)/usr/bin/daed
@@ -164,7 +167,7 @@ jobs:
             grep -E '^PKG_(NAME|VERSION|RELEASE|MIRROR_HASH|BUILD_DEPENDS)' "$MK"
             echo
             echo "=== Makefile 尾部（覆盖块应在 eval 之前）==="
-            tail -35 "$MK" | cat -A
+            tail -40 "$MK" | cat -A
           } 2>&1 | tee /tmp/08-patch.log
 
       - name: Pre-seed downloads
